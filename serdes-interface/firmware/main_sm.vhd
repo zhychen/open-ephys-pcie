@@ -11,31 +11,39 @@ port(
 	clk_spi  : in std_logic; 
 	reset    : in std_logic; 
 	miso_reg : in std_logic_vector(15 downto 0); 
-	data_lclkin : in std_logic; --this the signal that signal's end of a SPI command. 
-	
-	spi_start_o : out std_logic; 
+	data_lclkin : in std_logic; --this the signal that signal's end of a SPI command.
+    regaddr: in unsigned(7 downto 0); --intan register addresses
+    regval: in unsigned(7 downto 0); --intan register values
+    regconf: in std_logic; --pulse to signal a configuration
+    adcconf: in std_logic; --pulse to start adc configuration
+
+	spi_start_o : out std_logic;
 	command_o : out std_logic_vector(15 downto 0);
 	hsync_o : out std_logic
+    regack: out std_logic; --register configuration is successful
 );
 end main_sm;
 
 architecture Behavioral of main_sm is
 
 --state machine
-type master_sm_type is (IDLE, REGCONF, ADCCONF, ACQ); 
+type master_sm_type is (IDLE, REGCONF, ADCCONF, ACQ, RECONF);
 signal master_sm, master_sm_next : master_sm_type;
 
 type hsync_sm_type is (IDLE, CH0); 
 signal hsync_state, hsync_state_next : hsync_sm_type;
 
 --signals 
-signal sm_cnt, sm_cnt_next : unsigned(5 downto 0); 
-signal cmd, cmd_next : std_logic_vector(15 downto 0); 
+signal sm_cnt, sm_cnt_next : unsigned(5 downto 0);
+signal sm2_cnt, sm2_cnt_next : unsigned (5 downto 0); --same functionality as sm_cnt but used for reconfiguration state
+signal cmd, cmd_next : std_logic_vector(15 downto 0);
+signal addr: unsigned(5 downto 0); -- 6-bit register address for register configuration cmd
 signal cmd_d1, cmd_d2 : std_logic_vector(7 downto 0); --this is the delay version of command. currently only use for checking the configurations
 signal spi_start, spi_start_next : std_logic; 
 signal verify_cnt, verify_cnt_next : unsigned(5 downto 0); 
 signal hsync_cnt, hsync_cnt_next : unsigned(4 downto 0); 
-signal hsync, hsync_next : std_logic; 
+signal hsync, hsync_next : std_logic;
+signal reg_ack, reg_ack_next : std_logic;
 
 --a bank of all the configuration values 
 type rom_type is array ( 0 to 21) of std_logic_vector(7 downto 0);
@@ -111,7 +119,8 @@ begin
 --signal mapping 
 command_o <= cmd; 
 spi_start_o <= spi_start;
-hsync_o <= hsync; 
+hsync_o <= hsync;
+regack = reg_ack;
 
 --delay the cmd output with data_lclk
 delay_cmd_prc : process(data_lclkin, clk_spi, reset, cmd_d1) 
@@ -136,16 +145,20 @@ begin
 	if (reset = '1') then 
 		master_sm <= IDLE; 
 		sm_cnt <= (others=>'0');
+        sm2_cnt <= (others=>'0');
 		cmd <= (others=>'0'); 
 		verify_cnt <= (others=>'0'); 
-		spi_start <= '0'; 
+		spi_start <= '0';
+        reg_ack <= '0';
 	elsif (rising_edge(clk_spi)) then --next state logic
 		master_sm <= master_sm_next;
-		sm_cnt <= sm_cnt_next; 
+		sm_cnt <= sm_cnt_next;
+        sm2_cnt <= sm2_cnt_next;
 		cmd <= cmd_next; 
 		verify_cnt <= verify_cnt_next; 
-		spi_start <= spi_start_next; 
-	end if; 
+		spi_start <= spi_start_next;
+        reg_ack <= reg_ack_next;
+	end if;
 end process;
 
 --next state logic
@@ -155,7 +168,8 @@ begin
 		when IDLE => 
 			master_sm_next <= REGCONF; 
 			spi_start_next <= '1';
-			sm_cnt_next <= sm_cnt + 1; 
+			sm_cnt_next <= sm_cnt + 1;
+            sm2_cnt_next <= sm2_cnt + 1;
 			cmd_next <= WRITEREG & std_logic_vector(sm_cnt) & CONFIG_ROM(to_integer(sm_cnt));
 			verify_cnt_next <= (others=>'0');
 		when REGCONF => --go through all the configuration registers (generate command, and spi_start signal, look for data_lclkin before moving to the next state) 
@@ -211,7 +225,7 @@ begin
 			if data_lclkin = '1' then 
 				if sm_cnt <= 50 then --9
 					sm_cnt_next <= sm_cnt + 1; 
-					master_sm_next <= ADCCONF; 
+					master_sm_next <= ADCCONF;
 					cmd_next <= DUMMY_ROM(0);
 				else 
 					sm_cnt_next <= (others=>'0');
@@ -226,25 +240,79 @@ begin
 				cmd_next <= cmd; 
 			end if; 
 			verify_cnt_next <= verify_cnt;
-		when ACQ => 
-			if data_lclkin = '1' then 
-				if sm_cnt >= 34 then --reset channel count back to 0 
-					sm_cnt_next <= (others=>'0'); 
-				else 
-					sm_cnt_next <= sm_cnt + 1; 
-				end if; 
-				cmd_next <= "00" & std_logic_vector(sm_cnt) & "00000000";
-				--cmd_next <= "11" & std_logic_vector(to_unsigned(59,6)) & "00000000"; --read from 40 to 44 registers	--read for INTAN 
-				spi_start_next <= '1';
+		when ACQ =>
+            if data_lclkin = '1' then
+                if regconf = '1' then
+                    master_sm_next <= RECONF;
+                    sm_cnt_next <= sm_cnt;
+                    spi_start_next <= '0';
+                    cmd_next <= cmd;
+                else
+                    if sm_cnt >= 34 then --reset channel count back to 0
+                        sm_cnt_next <= (others=>'0');
+                    else
+                        sm_cnt_next <= sm_cnt + 1;
+                    end if;
+                    cmd_next <= "00" & std_logic_vector(sm_cnt) & "00000000";
+                    --cmd_next <= "11" & std_logic_vector(to_unsigned(59,6)) & "00000000"; --read from 40 to 44 registers	--read for INTAN
+                    spi_start_next <= '1';
+                    master_sm_next <= ACQ;
+                end if;
 			else 
 				sm_cnt_next <= sm_cnt;
 				spi_start_next <= '0'; 
-				cmd_next <= cmd; 
+				cmd_next <= cmd;
+                master_sm_next <= ACQ;
 			end if; 
-			master_sm_next <= ACQ;
+			--master_sm_next <= ACQ;
 			verify_cnt_next <= verify_cnt;
-	end case; 
-end process; 
+        when RECONF =>
+            if data_lclkin = '1' then
+                if sm2_cnt = 1 then
+                    sm2_cnt_next <= sm2_cnt + 1;
+                    master_sm_next <= RECONF;
+                    addr <= regaddr(5 downto 0);
+                    cmd_next <= WRITEREG & addr & regval;
+                    spi_start_next <= '1';
+                elsif sm2_cnt = 2 then
+                    sm2_cnt_next <= sm2_cnt + 1;
+                    master_sm_next <= RECONF;
+                    spi_start_next <= '1';
+                    cmd_next <= cmd;
+                elsif sm2_cnt = 3 then
+                    sm2_cnt_next <= sm2_cnt + 1;
+                    if miso_reg(7 downto 0) = cmd_d2(7 downto 0) then
+                        reg_ack_next <= 1;
+                        if adcconf = 1 then
+                            master_sm_next <= ADCCONF;
+                            sm2_cnt_next <= (others=>'0');
+                            spi_start_next <= '1';
+                            cmd_next <= CALIB;
+                        else
+                            sm2_cnt_next <= (others=>'0');
+                            master_sm_next <=ACQ;
+                            cmd_next <= cmd;
+                        end if;
+                    else
+                        master_sm_next <=RECONF;
+                        spi_start_next <= '0';
+                        cmd_next <= (other=>'0');
+                        reg_ack_next <= 0;
+                    end if;
+                else
+                    master_sm_next <= REGCONF; --debug change
+                    sm_cnt_next <= sm_cnt;
+                    spi_start_next <= '0';
+                    cmd_next <= (others=>'0');
+            else
+                sm2_cnt_next <= sm2_cnt;
+                spi_start_next <= '0';
+                master_sm_next <= master_sm;
+                cmd_next <= cmd;
+                verify_cnt_next <= verify_cnt;
+            end if;
+	end case;
+end process;
 
 --one shot hsync for channel 0 
 one_shot_hsync : process(clk_spi, reset) 
